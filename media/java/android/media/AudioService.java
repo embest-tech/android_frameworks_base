@@ -472,7 +472,8 @@ public class AudioService extends IAudioService.Stub implements OnFinished {
             "ro.config.vc_call_vol_steps",
            MAX_STREAM_VOLUME[AudioSystem.STREAM_VOICE_CALL]);
 
-        if (SystemProperties.get("ro.product.device").contains("hdmidongle"))
+        if (SystemProperties.get("ro.product.device").contains("hdmidongle") ||
+			SystemProperties.get("ro.product.device").contains("marsboard_6q"))
 		mFixedVolumeDevices &= ~AudioSystem.DEVICE_OUT_AUX_DIGITAL;
 
         sSoundEffectVolumeDb = context.getResources().getInteger(
