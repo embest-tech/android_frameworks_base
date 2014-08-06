@@ -1143,7 +1143,7 @@ public class SystemServer {
             // hope that time from cell towers or NTP fixes it
             // shortly.
             Slog.w(TAG, "System clock is before 1970; setting to 1970.");
-            SystemClock.setCurrentTimeMillis(EARLIEST_SUPPORTED_TIME);
+//            SystemClock.setCurrentTimeMillis(EARLIEST_SUPPORTED_TIME);		//embest
         }
 
         if (SamplingProfilerIntegration.isEnabled()) {
