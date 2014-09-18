@@ -478,7 +478,9 @@ public class AudioService extends IAudioService.Stub {
             "ro.config.vc_call_vol_steps",
            MAX_STREAM_VOLUME[AudioSystem.STREAM_VOICE_CALL]);
 
-        if (SystemProperties.get("ro.product.device").contains("hdmidongle"))
+        if (SystemProperties.get("ro.product.device").contains("hdmidongle") ||
+			SystemProperties.get("ro.product.device").contains("sbc9000_6q") ||
+			SystemProperties.get("ro.product.device").contains("RIoTboard_6solo"))
 		mFixedVolumeDevices &= ~AudioSystem.DEVICE_OUT_AUX_DIGITAL;
 
         sSoundEffectVolumeDb = context.getResources().getInteger(
