@@ -35,6 +35,16 @@ import com.android.server.net.BaseNetworkObserver;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.io.File;
+import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+
 /**
  * This class tracks the data connection associated with Ethernet
  * This is a singleton class and an instance will be created by
@@ -57,17 +67,43 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
     private LinkCapabilities mLinkCapabilities;
     private NetworkInfo mNetworkInfo;
     private InterfaceObserver mInterfaceObserver;
-    private String mHwAddr;
+	private static String mHwAddr;
     private static PowerManager.WakeLock mEthernetWakeLock;
 
     /* For sending events to connectivity service handler */
     private Handler mCsHandler;
+	private Context mContext;
 
     private static EthernetDataTracker sInstance;
     private static String sIfaceMatch = "";
     private static String mIface = "";
 
     private INetworkManagementService mNMService;
+
+    /* Add for UI support */
+    private static Handler mHandler = null;
+    private int mPrefixLength;
+    private boolean userflag;
+
+    private static final String ETH_CONN_MODE_DHCP = "dhcp";
+    private static final String ETH_CONN_MODE_MANUAL = "manual";
+
+    public static final int ETHER_IFACE_STATE_DOWN = 0;
+    public static final int ETHER_IFACE_STATE_UP = 1;
+
+    public static final int ETHER_MSG_ADD_INTERFACE = 2;
+    public static final int ETHER_MSG_REMOVE_INTERFACE = 3;
+    public static final int ETHER_MSG_CONNECTED_FAILED = 4;
+    public static final int ETHER_MSG_CONNECTED_SUCCESS = 5;
+    public static final int ETHER_MSG_INTERFACE_STATUS_CHANGE = 6;
+    public static final int ETHER_MSG_CABLE_LINK_DOWN = 7;
+
+    private static String mIpAddr = "";
+    private static String mGateway = "";
+    private static String mNetmask = "";
+    private static String mDns1 = "";
+    private static String mDns2 = "";
+    private static String mode = ETH_CONN_MODE_DHCP;
 
     private static class InterfaceObserver extends BaseNetworkObserver {
         private EthernetDataTracker mTracker;
@@ -84,12 +120,29 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
 
         @Override
         public void interfaceLinkStateChanged(String iface, boolean up) {
-            if (mIface.equals(iface)) {
+            if (mIface.equals(iface) || (mIface.isEmpty() && iface.matches(sIfaceMatch))) {
                 Log.d(TAG, "Interface " + iface + " link " + (up ? "up" : "down"));
+				mIface = iface;
                 mLinkUp = up;
                 mNfsmode = "yes".equals(SystemProperties.get("ro.nfs.mode", "no"));
                 mAlwayson = "yes".equals(SystemProperties.get("ro.ethernet.alwayson.mode", "yes"));
                 mTracker.mNetworkInfo.setIsAvailable(up);
+
+                if (mHwAddr == null) {
+                    IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
+                    INetworkManagementService service = INetworkManagementService.Stub.asInterface(b);
+                    try {
+                        InterfaceConfiguration config = service.getInterfaceConfig(iface);
+                        if (config != null) {
+                            mHwAddr = config.getHardwareAddress();
+                        }
+                    } catch (RemoteException e) {
+                        Log.e(TAG, "Could not get list of interfaces " + e);
+                    }
+                }
+
+                mTracker.sendMessage(ETHER_MSG_INTERFACE_STATUS_CHANGE,
+                                     new scanResult(iface, mHwAddr, mLinkUp));
 
                 // use DHCP
                 if (up) {
@@ -99,7 +152,7 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
                 } else {
                     if (mAlwayson)
                         mEthernetWakeLock.release();
-                    mTracker.disconnect();
+					mTracker.clearConnections();
                 }
             }
         }
@@ -119,6 +172,7 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
         mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORKTYPE, "");
         mLinkProperties = new LinkProperties();
         mLinkCapabilities = new LinkCapabilities();
+		userflag = true;
     }
 
     private void interfaceAdded(String iface) {
@@ -148,6 +202,7 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
     public void disconnect() {
 
         NetworkUtils.stopDhcp(mIface);
+		sendMessage(ETHER_MSG_CONNECTED_FAILED, new connectResult(mIface, null));
 
         mLinkProperties.clear();
         mNetworkInfo.setIsAvailable(false);
@@ -179,20 +234,76 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
         mIface = "";
     }
 
+    private void runStaticIp() {
+        Thread StaticIpThread = new Thread(new Runnable() {
+            public void run() {
+                if (mIpAddr == null) {
+                    sendMessage(ETHER_MSG_CONNECTED_FAILED, new connectResult(mIface, null));
+                    return;
+                }
+                mDns2 = null;
+                InterfaceConfiguration ifcg = new InterfaceConfiguration();
+                ifcg.setLinkAddress(makeLinkAddress());
+                try {
+                    mNMService.setInterfaceConfig(mIface, ifcg);
+                    Log.e(TAG, "Static IP configuration succeeded");
+                } catch (RemoteException re) {
+                    Log.e(TAG, "Static IP configuration failed: " + re);
+                    sendMessage(ETHER_MSG_CONNECTED_FAILED, new connectResult(mIface, null));
+                    return;
+                } catch (IllegalStateException e) {
+                    Log.e(TAG, "Static IP configuration failed: " + e);
+                    sendMessage(ETHER_MSG_CONNECTED_FAILED, new connectResult(mIface, null));
+                    return;
+                }
+
+                mLinkProperties = makeLinkProperties();
+                mLinkProperties.setInterfaceName(mIface);
+
+                mNetworkInfo.setDetailedState(DetailedState.CONNECTED, null, mHwAddr);
+                Message msg = mCsHandler.obtainMessage(EVENT_STATE_CHANGED, mNetworkInfo);
+                msg.sendToTarget();
+
+                try {
+                    InterfaceConfiguration config = mNMService.getInterfaceConfig(mIface);
+                    byte[] c = config.getLinkAddress().getAddress().getAddress();
+                    String ipaddr = ipConvert(c);
+                    sendMessage(ETHER_MSG_CONNECTED_SUCCESS, new connectResult(mIface, ipaddr));
+
+                } catch (RemoteException e) {
+                    Log.e(TAG, "Could not get list of interfaces " + e);
+                }
+            }
+        });
+
+        StaticIpThread.start();
+    }
+
     private void runDhcp() {
         Thread dhcpThread = new Thread(new Runnable() {
             public void run() {
                 DhcpResults dhcpResults = new DhcpResults();
                 if (!NetworkUtils.runDhcp(mIface, dhcpResults)) {
                     Log.e(TAG, "DHCP request error:" + NetworkUtils.getDhcpError());
+					sendMessage(ETHER_MSG_CONNECTED_FAILED, new connectResult(mIface, null));
                     return;
                 }
                 mLinkProperties = dhcpResults.linkProperties;
+				mLinkProperties.setInterfaceName(mIface);
 
-                mNetworkInfo.setIsAvailable(true);
                 mNetworkInfo.setDetailedState(DetailedState.CONNECTED, null, mHwAddr);
                 Message msg = mCsHandler.obtainMessage(EVENT_STATE_CHANGED, mNetworkInfo);
                 msg.sendToTarget();
+
+                try {
+                    InterfaceConfiguration config = mNMService.getInterfaceConfig(mIface);
+                    byte[] c = config.getLinkAddress().getAddress().getAddress();
+                    String ipaddr = ipConvert(c);
+                    sendMessage(ETHER_MSG_CONNECTED_SUCCESS, new connectResult(mIface, ipaddr));
+                } catch (RemoteException e) {
+                    Log.e(TAG, "Could not get list of interfaces " + e);
+                }
+
             }
         });
         dhcpThread.start();
@@ -221,6 +332,7 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
     public void startMonitoring(Context context, Handler target) {
         mContext = context;
         mCsHandler = target;
+		mLinkUp = false;
 
         final PowerManager powerManager = (PowerManager)context.getSystemService(
                 Context.POWER_SERVICE);
@@ -239,22 +351,31 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
             final String[] ifaces = mNMService.listInterfaces();
             for (String iface : ifaces) {
                 if (iface.matches(sIfaceMatch)) {
-                    mIface = iface;
+                    //mIface = iface;
                     mNMService.setInterfaceUp(iface);
                     InterfaceConfiguration config = mNMService.getInterfaceConfig(iface);
-                    if (config != null && mHwAddr == null) {
-                        mHwAddr = config.getHardwareAddress();
-                        if (mHwAddr != null) {
-                            mNetworkInfo.setExtraInfo(mHwAddr);
+
+                    if (getEthernetCarrierState(iface) == 1) {
+                        mIface = iface;
+                        mLinkUp = true;
+                        mNetworkInfo.setIsAvailable(true);
+
+                        if (config != null && mHwAddr == null) {
+                            mHwAddr = config.getHardwareAddress();
+
+                            if (mHwAddr != null) {
+                                mNetworkInfo.setExtraInfo(mHwAddr);
+                            }
                         }
                     }
 
                     // if a DHCP client had previously been started for this interface, then stop it
-                    NetworkUtils.stopDhcp(mIface);
-
-                    reconnect();
+					NetworkUtils.stopDhcp(iface);
                 }
             }
+
+			reconnect();
+
         } catch (RemoteException e) {
             Log.e(TAG, "Could not get list of interfaces " + e);
         }
@@ -280,9 +401,14 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
      * Re-enable connectivity to a network after a {@link #teardown()}.
      */
     public boolean reconnect() {
-        if (mLinkUp) {
+        if (mLinkUp && userflag) {
             mTeardownRequested.set(false);
-            runDhcp();
+            if(mIface.isEmpty())
+                return false;
+            if(this.mode.equals(ETH_CONN_MODE_MANUAL))
+                runStaticIp();
+            else
+                runDhcp();
         }
         return mLinkUp;
     }
@@ -432,13 +558,204 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
         mLinkProperties.addStackedLink(link);
     }
 
+	public void setHandler(Handler handler){
+	mHandler = handler;
+	}
+
     @Override
     public void removeStackedLink(LinkProperties link) {
         mLinkProperties.removeStackedLink(link);
     }
 
-    @Override
-    public void supplyMessenger(Messenger messenger) {
-        // not supported on this network
+     public void clearConnections() {
+         synchronized (this) {
+             if (mIface.isEmpty())
+                 return;
+ 
+             disconnect();
+             mIface = "";
+             mHwAddr = null;
+             mode = ETH_CONN_MODE_DHCP;
+         }
+	}
+
+    public boolean configureIfc(String iFace,
+                                String ipAddr,
+                                String gateway,
+                                String netmask,
+                                String dns1,
+                                String mode,
+                                String HwAddr,
+                                boolean linkUp) {
+        if (!mIface.equals(iFace) && !mIface.isEmpty())
+            return false;
+
+        synchronized (this) {
+            this.mIface = iFace;
+            this.mIpAddr = ipAddr;
+            this.mGateway = gateway;
+            this.mNetmask = netmask;
+            this.mDns1 = dns1;
+            this.mode = mode;
+            this.mHwAddr = HwAddr;
+            mNetworkInfo.setIsAvailable(linkUp);
+            mNetworkInfo.setExtraInfo(HwAddr);
+        }
+
+        disconnect();
+        reconnect();
+        return true;
     }
+
+
+    public void scanInterface() {
+        String tempHwAddr = null;
+        boolean tempLinkUp;
+
+        try {
+            final String[] ifaces = mNMService.listInterfaces();
+            for (String iface : ifaces) {
+                if (iface.matches(sIfaceMatch)) {
+                    mNMService.setInterfaceUp(iface);
+                    InterfaceConfiguration config = mNMService.getInterfaceConfig(iface);
+                    if (config != null) {
+                        tempHwAddr = config.getHardwareAddress();
+                    }
+
+                    if (getEthernetCarrierState(iface) == 1) {
+                        tempLinkUp = true;
+                    } else {
+                        tempLinkUp = false;
+                    }
+
+                    sendMessage(ETHER_MSG_ADD_INTERFACE,
+                                new scanResult(iface, tempHwAddr, tempLinkUp));
+                }
+            }
+        } catch (RemoteException e) {
+            Log.e(TAG, "Could not get list of interfaces " + e);
+        }
+    }
+
+    private void sendMessage(int what, Object obj) {
+        if (mHandler != null) {
+            Message message =  mHandler.obtainMessage(what, obj);
+            mHandler.sendMessage(message);
+        }
+    }
+
+    private void sendEmptyMessage(int what) {
+        if (mHandler != null)
+            mHandler.sendEmptyMessage(what);
+    }
+
+    public void setUserFlag(boolean flag) {
+        userflag = flag;
+    }
+
+    private LinkAddress makeLinkAddress() {
+        mPrefixLength = 24;
+        try {
+            InetAddress mask = NetworkUtils.numericToInetAddress(mNetmask);
+            mPrefixLength = NetworkUtils.netmaskIntToPrefixLength(NetworkUtils.inetAddressToInt((Inet4Address)mask));
+        } catch (Exception e) {
+            Log.e(TAG, "netmask to prefixLength exception: " + e);
+            return null;
+        }
+        if(mIpAddr == null || mIpAddr.equals("")) {
+            Log.e(TAG, "makeLinkAddress with empty ipAddress");
+            return null;
+        }
+        return new LinkAddress(NetworkUtils.numericToInetAddress(mIpAddr), mPrefixLength);
+    }
+
+    private LinkProperties makeLinkProperties() {
+        LinkProperties p = new LinkProperties();
+        p.addLinkAddress(makeLinkAddress());
+        p.addRoute(new RouteInfo(NetworkUtils.numericToInetAddress(mGateway)));
+        p.addDns(NetworkUtils.numericToInetAddress(mDns1));
+        p.addDns(NetworkUtils.numericToInetAddress(mDns2));
+        return p;
+    }
+
+    private String ipConvert(byte[] src) {
+        String a = Integer.toString(0x0ff & src[0]);
+        String b = Integer.toString(0x0ff & src[1]);
+        String c = Integer.toString(0x0ff & src[2]);
+        String d = Integer.toString(0x0ff & src[3]);
+        return a + "." + b + "." + c + "." + d;
+    }
+
+    private String ReadFromFile(File file) {
+        if((file != null) && file.exists()) {
+            try {
+                FileInputStream fin= new FileInputStream(file);
+                BufferedReader reader= new BufferedReader(new InputStreamReader(fin));
+                String flag = reader.readLine();
+                fin.close();
+                return flag;
+            }
+            catch(IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        return null;
+    }
+
+    public int getEthernetIfaceState(String iface) {
+        File file = new File("/sys/class/net/"+iface+"/flags");
+        String flags = ReadFromFile(file);
+        if (flags == null) {
+            return ETHER_IFACE_STATE_DOWN;
+        }
+
+        String flags_no_0x = flags.substring(2);
+        int flags_int = Integer.parseInt(flags_no_0x, 16);
+        if ((flags_int & 0x1)>0) {
+            return ETHER_IFACE_STATE_UP;
+        } else {
+            return ETHER_IFACE_STATE_DOWN;
+        }
+    }
+
+    /*
+    0: no carrier (RJ45 unplug)
+    1: carrier exist (RJ45 plugin)
+    */
+    public int getEthernetCarrierState(String iface) {
+        int state = getEthernetIfaceState(iface);
+        if (state == ETHER_IFACE_STATE_UP) {
+            File file = new File("/sys/class/net/" + iface + "/carrier");
+            String carrier = ReadFromFile(file);
+            Log.d(TAG, "carrier=" + carrier);
+            int carrier_int = Integer.parseInt(carrier);
+            return carrier_int;
+        } else {
+            return 0;
+        }
+    }
+
+    public static class scanResult {
+        scanResult(String iFace, String HwAddr, boolean linkUp) {
+            this.iFace = iFace;
+            this.HwAddr= HwAddr;
+            this.linkUp = linkUp;
+        }
+
+        public String iFace;
+        public String HwAddr;
+        public boolean linkUp;
+    }
+
+    public static class connectResult {
+        connectResult(String iFace, String ipAddr) {
+            this.iFace = iFace;
+            this.ipAddr= ipAddr;
+        }
+
+        public String iFace;
+        public String ipAddr;
+    }
+
 }
